@@ -52,6 +52,19 @@ PARAM_DEFINE_INT32(SIM_GZ_EN, 0);
 PARAM_DEFINE_INT32(SIM_GZ_EN_LIDAR, 1);
 
 /**
+ * Drop Gazebo 2D lidar obstacle distance publication
+ *
+ * Used for SITL fault injection. When enabled, Gazebo bridge stops publishing
+ * obstacle_distance from the 2D lidar while the rest of the bridge keeps running.
+ *
+ * @boolean
+ * @group Simulation
+ * @value 0 Disabled
+ * @value 1 Enabled
+ */
+PARAM_DEFINE_INT32(SIM_GZ_LIDAR_F, 0);
+
+/**
  * Enable optical flow sensor in Gazebo bridge
  *
  * @boolean

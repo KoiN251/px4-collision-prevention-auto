@@ -33,6 +33,7 @@
 
 #include <gtest/gtest.h>
 #include "CollisionPrevention.hpp"
+#include <mathlib/math/TrajMath.hpp>
 
 using namespace matrix;
 
@@ -73,6 +74,17 @@ public:
 	bool test_enterData(int map_index, float sensor_range, float sensor_reading)
 	{
 		return _enterData(map_index, sensor_range, sensor_reading);
+	}
+	void test_setObstacleBin(int bin, uint16_t distance_cm, uint16_t max_range_cm, hrt_abstime timestamp)
+	{
+		_obstacle_map_body_frame.timestamp = timestamp;
+		_obstacle_map_body_frame.min_distance = 100;
+		_obstacle_map_body_frame.max_distance = max_range_cm;
+		_obstacle_map_body_frame.distances[bin] = distance_cm;
+		_data_timestamps[bin] = timestamp;
+		_data_maxranges[bin] = max_range_cm;
+		_data_fov[bin] = true;
+		_updateObstacleData();
 	}
 };
 
@@ -1369,4 +1381,86 @@ TEST_F(CollisionPreventionTest, enterData)
 	EXPECT_TRUE(cp.test_enterData(16, 20.f, 21.f)); //same range, reading out of range
 	EXPECT_TRUE(cp.test_enterData(16, 30.f, 1.5f)); //longer range, reading in range
 	EXPECT_TRUE(cp.test_enterData(16, 30.f, 31.f)); //longer range, reading out of range
+}
+TEST_F(CollisionPreventionTest, safeVelocityUsesMeasuredVelocity)
+{
+	TestTimingCollisionPrevention cp;
+	mocked_time = 1_s;
+
+	param_t param = param_handle(px4::params::CP_DIST);
+	float value = 2.f;
+	param_set(param, &value);
+	cp.paramsChanged();
+
+	cp.test_setObstacleBin(0, 1000, 2000, mocked_time);
+
+	const Vector2f travel_direction{1.f, 0.f};
+	const Vector2f slow_velocity{1.f, 0.f};
+	const Vector2f fast_velocity{5.f, 0.f};
+
+	const auto slow = cp.calculateSafeVelocity(travel_direction, slow_velocity, 4.f, 2.f);
+	const auto fast = cp.calculateSafeVelocity(travel_direction, fast_velocity, 4.f, 2.f);
+
+	EXPECT_TRUE(slow.valid);
+	EXPECT_TRUE(fast.valid);
+	EXPECT_GT(slow.stopping_distance, fast.stopping_distance);
+	EXPECT_GT(slow.safe_velocity, fast.safe_velocity);
+}
+TEST_F(CollisionPreventionTest, safeVelocityCriticalWhenStoppingDistanceNegative)
+{
+	TestTimingCollisionPrevention cp;
+	mocked_time = 1_s;
+
+	param_t param = param_handle(px4::params::CP_DIST);
+	float value = 2.f;
+	param_set(param, &value);
+	cp.paramsChanged();
+
+	cp.test_setObstacleBin(0, 250, 2000, mocked_time);
+
+	const auto result = cp.calculateSafeVelocity({1.f, 0.f}, {2.f, 0.f}, 4.f, 2.f);
+
+	EXPECT_TRUE(result.valid);
+	EXPECT_TRUE(result.critical);
+	EXPECT_FLOAT_EQ(result.safe_velocity, 0.f);
+}
+TEST_F(CollisionPreventionTest, safeVelocityIgnoresObstacleBehindTravelDirection)
+{
+	TestTimingCollisionPrevention cp;
+	mocked_time = 1_s;
+
+	param_t param = param_handle(px4::params::CP_DIST);
+	float value = 2.f;
+	param_set(param, &value);
+	cp.paramsChanged();
+
+	cp.test_setObstacleBin(36, 300, 2000, mocked_time); // 180 deg, behind forward travel
+
+	const auto result = cp.calculateSafeVelocity({1.f, 0.f}, {1.f, 0.f}, 4.f, 2.f);
+
+	EXPECT_FALSE(result.valid);
+}
+
+TEST_F(CollisionPreventionTest, safeVelocityUsesBrakingAcceleration)
+{
+	TestTimingCollisionPrevention cp;
+	mocked_time = 1_s;
+
+	param_t param = param_handle(px4::params::CP_DIST);
+	float value = 2.f;
+	param_set(param, &value);
+	cp.paramsChanged();
+
+	cp.test_setObstacleBin(0, 1000, 2000, mocked_time);
+
+	const auto low_braking_accel = cp.calculateSafeVelocity({1.f, 0.f}, {2.f, 0.f}, 4.f, 1.5f);
+	const auto high_braking_accel = cp.calculateSafeVelocity({1.f, 0.f}, {2.f, 0.f}, 4.f, 4.f);
+
+	EXPECT_TRUE(low_braking_accel.valid);
+	EXPECT_TRUE(high_braking_accel.valid);
+	EXPECT_NE(low_braking_accel.safe_velocity, high_braking_accel.safe_velocity);
+	EXPECT_FLOAT_EQ(low_braking_accel.safe_velocity,
+			math::trajectory::computeMaxSpeedFromDistance(4.f, 1.5f, low_braking_accel.stopping_distance, 0.f));
+	EXPECT_FLOAT_EQ(high_braking_accel.safe_velocity,
+			math::trajectory::computeMaxSpeedFromDistance(4.f, 4.f, high_braking_accel.stopping_distance, 0.f));
 }

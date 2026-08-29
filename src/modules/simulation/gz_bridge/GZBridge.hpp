@@ -200,6 +200,7 @@ private:
 		(ParamInt<px4::params::SIM_GZ_EN_ASPD>) _sim_gz_en_aspd,
 		(ParamInt<px4::params::SIM_GZ_EN_BARO>) _sim_gz_en_baro,
 		(ParamInt<px4::params::SIM_GZ_EN_ODOM>) _sim_gz_en_odom,
-		(ParamInt<px4::params::SIM_GZ_EN_GPS>) _sim_gz_en_gps
+		(ParamInt<px4::params::SIM_GZ_EN_GPS>) _sim_gz_en_gps,
+		(ParamInt<px4::params::SIM_GZ_LIDAR_F>) _param_sim_gz_lidar_fault
 	)
 };

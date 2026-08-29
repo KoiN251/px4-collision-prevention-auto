@@ -78,7 +78,31 @@ public:
 	 * @param setpoint_accel setpoint purely based on sticks, to be modified
 	 * @param setpoint_vel current velocity setpoint as information to be able to stop in time, does not get changed
 	 */
-	void modifySetpoint(matrix::Vector2f &setpoint_accel, const matrix::Vector2f &setpoint_vel);
+
+ 	void modifySetpoint(matrix::Vector2f &setpoint_accel, const matrix::Vector2f &setpoint_vel);
+
+	void update(); // update data and calculate constraints not call modifysetpoint in manual mode
+
+	bool obstacleDataPresent() const { return _obstacle_data_present; } // check if obstacle data is present
+	float getClosestDistance() const { return _closest_dist; } // get closest distance to an obstacle
+	matrix::Vector2f getClosestObstacleDirection() const { return _closest_dist_dir; } // get direction of the closest obstacle
+	float getDistanceInDirection(const matrix::Vector2f &direction); // get distance to an obstacle in a specific direction
+
+	struct SafeVelocityResult { // result of the safe velocity calculation
+		bool valid{false};
+		bool braking_required{false};
+		bool critical{false};
+		float safe_velocity{INFINITY};
+		float obstacle_distance{INFINITY};
+		float stopping_distance{INFINITY};
+		float measured_velocity_parallel{0.f};
+		matrix::Vector2f obstacle_direction{};
+	};
+	// Calculates the safe velocity in a given direction based on the current obstacle distances, measured velocity and max jerk and braking acceleration
+	SafeVelocityResult calculateSafeVelocity(const matrix::Vector2f &travel_direction,
+			const matrix::Vector2f &measured_velocity, float max_jerk, float max_braking_accel);
+
+	// end fix
 
 	static constexpr int BIN_COUNT =
 		sizeof(obstacle_distance_s::distances) / sizeof(obstacle_distance_s::distances[0]); // 72

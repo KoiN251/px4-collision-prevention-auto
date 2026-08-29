@@ -83,19 +83,11 @@ bool CollisionPrevention::is_active()
 
 void CollisionPrevention::modifySetpoint(Vector2f &setpoint_accel, const Vector2f &setpoint_vel)
 {
-	if (_vehicle_attitude_sub.updated()) {
-		vehicle_attitude_s vehicle_attitude;
-
-		if (_vehicle_attitude_sub.copy(&vehicle_attitude)) {
-			_vehicle_attitude = Quatf(vehicle_attitude.q);
-			_vehicle_yaw = Eulerf(_vehicle_attitude).psi();
-		}
-	}
-
 	//calculate movement constraints based on range data
 	const Vector2f original_setpoint = setpoint_accel;
-	_updateObstacleMap();
-	_updateObstacleData();
+
+	update();
+
 	_calculateConstrainedSetpoint(setpoint_accel, setpoint_vel);
 
 	// publish constraints
@@ -106,6 +98,97 @@ void CollisionPrevention::modifySetpoint(Vector2f &setpoint_accel, const Vector2
 	_constraints_pub.publish(constraints);
 }
 
+void CollisionPrevention::update()
+{
+	if (_vehicle_attitude_sub.updated()) {
+		vehicle_attitude_s vehicle_attitude;
+
+		if (_vehicle_attitude_sub.copy(&vehicle_attitude)) {
+			_vehicle_attitude = Quatf(vehicle_attitude.q);
+			_vehicle_yaw = Eulerf(_vehicle_attitude).psi();
+		}
+	}
+
+	_updateObstacleMap();
+	_updateObstacleData();
+}
+
+float CollisionPrevention::getDistanceInDirection(const Vector2f &direction)
+{
+	return _getObstacleDistance(direction);
+}
+
+CollisionPrevention::SafeVelocityResult CollisionPrevention::calculateSafeVelocity(
+	const Vector2f &travel_direction, const Vector2f &measured_velocity, float max_jerk, float max_braking_accel)
+{
+	SafeVelocityResult result{};
+
+	const Vector2f travel_dir = travel_direction.unit_or_zero();
+
+	//jerk/acceleration không hợp lệ thì trả về valid=false. Không cố tính bừa.
+	if (!_obstacle_data_present || !travel_dir.isAllFinite() || !measured_velocity.isAllFinite()
+	    || max_jerk <= FLT_EPSILON || max_braking_accel <= FLT_EPSILON) {
+		return result;
+	}
+	// get current time to calculate age of the data
+	const hrt_abstime now = getTime();
+	// calculate the minimum distance to keep from the obstacle.
+	// This is the maximum of the minimum distance from the obstacle map and the parameter value.
+	const float min_dist_to_keep = math::max(_obstacle_map_body_frame.min_distance * 0.01f, _param_cp_dist.get());
+
+	for (int i = 0; i < BIN_COUNT; i++) {
+		const uint16_t bin_distance_cm = _obstacle_map_body_frame.distances[i];
+		// if the distance is smaller than the minimum distance to keep or the bin is empty, SKIP IT!
+		if (bin_distance_cm <= _obstacle_map_body_frame.min_distance || bin_distance_cm == UINT16_MAX) {
+			continue;
+		}
+		// calculate the direction of the bin in body frame and then in world frame
+		const float bin_angle = wrap_2pi(_vehicle_yaw
+						+ math::radians((float)i * BIN_SIZE + _obstacle_map_body_frame.angle_offset));
+
+		const Vector2f bin_direction{cosf(bin_angle), sinf(bin_angle)};
+		const float travel_projection = travel_dir.dot(bin_direction); // projection of the travel direction onto the bin direction
+
+		if (travel_projection <= FLT_EPSILON) {
+			continue;
+		}
+		// calculate the distance to the obstacle in the direction of the bin,
+		// the "measured velocity" in that direction and the delay distance
+		const float obstacle_distance = bin_distance_cm * 0.01f;
+		const float measured_velocity_parallel = math::max(0.f, measured_velocity.dot(bin_direction));
+
+		float delay_distance = measured_velocity_parallel * _param_cp_delay.get();
+
+		const float max_range = _data_maxranges[i] * 0.01f;
+		// if the obstacle distance is smaller than the max range, add the delay distance based on the age of the data
+		if (obstacle_distance < max_range) {
+			const hrt_abstime data_age = now - _data_timestamps[i];
+			delay_distance += measured_velocity_parallel * (data_age * 1e-6f);
+		}
+		// calculate the stopping distance based on the obstacle distance,
+		// the minimum distance to keep and the delay distance
+		const float stopping_distance = obstacle_distance - min_dist_to_keep - delay_distance;
+		// calculate the maximum velocity towards the obstacle based on the stopping distance, max jerk and max braking acceleration
+		const float max_velocity_towards_obstacle = stopping_distance > 0.f
+				? math::trajectory::computeMaxSpeedFromDistance(max_jerk, max_braking_accel, stopping_distance, 0.f)
+				: 0.f;
+		// calculate the safe velocity in the travel direction based on the maximum velocity towards the obstacle and the projection of the travel direction onto the bin direction
+		const float safe_velocity = max_velocity_towards_obstacle / travel_projection;
+		// if the result is not valid or the safe velocity is smaller than the current safe velocity, update the result
+		if (!result.valid || safe_velocity < result.safe_velocity) {
+			result.valid = true; // the result is valid if there is at least one obstacle in the travel direction
+			result.critical = stopping_distance <= 0.f; // if the stopping distance is smaller than or equal to 0, the situation is critical
+			result.safe_velocity = safe_velocity;
+			result.obstacle_distance = obstacle_distance;
+			result.stopping_distance = stopping_distance;
+			result.measured_velocity_parallel = measured_velocity_parallel;
+			result.obstacle_direction = bin_direction;
+			result.braking_required = measured_velocity_parallel > max_velocity_towards_obstacle;
+		}
+	}
+
+	return result;
+}
 void CollisionPrevention::_updateObstacleMap()
 {
 	// add distance sensor data
@@ -186,7 +269,7 @@ void CollisionPrevention::_calculateConstrainedSetpoint(Vector2f &setpoint_accel
 	_min_dist_to_keep = math::max(_obstacle_map_body_frame.min_distance / 100.0f, _param_cp_dist.get());
 
 	const hrt_abstime now = getTime();
-
+// check if the stick is deflected, if not, we don't need to constrain the setpoint
 	const bool is_stick_deflected = setpoint_length > 0.001f;
 
 	if (_obstacle_data_present && is_stick_deflected) {
@@ -219,6 +302,7 @@ void CollisionPrevention::_calculateConstrainedSetpoint(Vector2f &setpoint_accel
 			}
 
 			PX4_WARN("No obstacle data, not moving...");
+			mavlink_log_critical(&_mavlink_log_pub, "Collision Prevention: no distance sensor data!\t");
 			_last_timeout_warning = now;
 		}
 	}

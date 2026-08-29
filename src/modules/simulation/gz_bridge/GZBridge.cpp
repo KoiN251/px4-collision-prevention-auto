@@ -927,7 +927,10 @@ void GZBridge::laserScanCallback(const gz::msgs::LaserScan &msg)
 
 		index++;
 	}
-
+	if (_param_sim_gz_lidar_fault.get()) {
+		return;
+	}
+	
 	_obstacle_distance_pub.publish(report);
 }
 

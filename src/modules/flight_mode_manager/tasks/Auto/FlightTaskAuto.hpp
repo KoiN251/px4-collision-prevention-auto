@@ -54,6 +54,13 @@
 #include <lib/weather_vane/WeatherVane.hpp>
 #include "StickAccelerationXY.hpp"
 
+#include <lib/collision_prevention/CollisionPrevention.hpp>
+#include <uORB/topics/vehicle_command.h>
+#include <commander/px4_custom_mode.h>
+
+#include <systemlib/mavlink_log.h>
+#include <uORB/topics/mavlink_log.h>
+
 /**
  * This enum has to agree with position_setpoint_s type definition
  * The only reason for not using the struct position_setpoint is because
@@ -112,6 +119,12 @@ protected:
 	bool isTargetModified() const;
 	void _updateTrajConstraints();
 
+	void _updateCollisionPreventionConstraints(bool &force_zero_velocity_setpoint);
+
+	bool _isCollisionStopConfirmed() const;
+	void _requestCollisionPosctl();
+	void _requestCollisionHold();
+
 	void rcHelpModifyYaw(float &yaw_sp);
 
 	/** determines when to trigger a takeoff (ignored in flight) */
@@ -131,6 +144,9 @@ protected:
 	float _mc_cruise_speed{NAN}; /**< Requested cruise speed. If not valid, default cruise speed is used. */
 	WaypointType _type{WaypointType::idle}; /**< Type of current target triplet. */
 
+	uORB::Publication<vehicle_command_s> _vehicle_command_pub{ORB_ID(vehicle_command)};
+	orb_advert_t _mavlink_log_pub{nullptr};
+
 	uORB::SubscriptionData<home_position_s>			_sub_home_position{ORB_ID(home_position)};
 	uORB::SubscriptionData<vehicle_status_s>		_sub_vehicle_status{ORB_ID(vehicle_status)};
 
@@ -142,7 +158,9 @@ protected:
 	bool _yaw_sp_aligned{false};
 
 	PositionSmoothing _position_smoothing;
+	CollisionPrevention _collision_prevention{this};
 	Vector3f _unsmoothed_velocity_setpoint;
+
 	Sticks _sticks{this};
 	StickAccelerationXY _stick_acceleration_xy{this};
 	StickYaw _stick_yaw{this};
@@ -151,6 +169,14 @@ protected:
 	WaypointType _type_previous{WaypointType::idle}; /**< Previous type of current target triplet. */
 	bool _is_emergency_braking_active{false};
 	bool _want_takeoff{false};
+
+	bool _collision_braking_active{false};
+	bool _collision_posctl_requested{false};
+	bool _collision_hold_requested{false};
+
+	hrt_abstime _collision_no_data_start{0};
+	hrt_abstime _collision_last_no_data_warning{0};
+	hrt_abstime _collision_clear_start{0};
 
 	DEFINE_PARAMETERS_CUSTOM_PARENT(FlightTask,
 					(ParamFloat<px4::params::MPC_XY_CRUISE>) _param_mpc_xy_cruise,
@@ -164,6 +190,8 @@ protected:
 					(ParamFloat<px4::params::MPC_ACC_UP_MAX>) _param_mpc_acc_up_max,
 					(ParamFloat<px4::params::MPC_ACC_DOWN_MAX>) _param_mpc_acc_down_max,
 					(ParamFloat<px4::params::MPC_JERK_AUTO>) _param_mpc_jerk_auto,
+					(ParamInt<px4::params::CP_AUTO_EN>) _param_cp_auto_en,
+					(ParamFloat<px4::params::CP_MAX_ANGLE>) _param_cp_max_angle,
 					(ParamFloat<px4::params::MPC_XY_TRAJ_P>) _param_mpc_xy_traj_p,
 					(ParamFloat<px4::params::MPC_XY_ERR_MAX>) _param_mpc_xy_err_max,
 					(ParamFloat<px4::params::MPC_LAND_SPEED>) _param_mpc_land_speed,
@@ -176,7 +204,9 @@ protected:
 					(ParamFloat<px4::params::MPC_Z_V_AUTO_UP>) _param_mpc_z_v_auto_up,
 					(ParamFloat<px4::params::MPC_Z_V_AUTO_DN>) _param_mpc_z_v_auto_dn,
 					(ParamFloat<px4::params::MPC_TKO_SPEED>) _param_mpc_tko_speed,
-					(ParamFloat<px4::params::MPC_TKO_RAMP_T>) _param_mpc_tko_ramp_t
+					(ParamFloat<px4::params::MPC_TKO_RAMP_T>) _param_mpc_tko_ramp_t,
+					(ParamFloat<px4::params::CP_BRAKE_ANGLE>) _param_cp_brake_angle,
+					(ParamFloat<px4::params::CP_STOP_VEL>) _param_cp_stop_vel
 				       );
 
 private:

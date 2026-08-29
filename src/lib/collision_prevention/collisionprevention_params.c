@@ -84,3 +84,46 @@ PARAM_DEFINE_FLOAT(CP_GUIDE_ANG, 30.f);
  * @group Multicopter Position Control
  */
 PARAM_DEFINE_INT32(CP_GO_NO_DATA, 0);
+
+/**
+ * Enable collision safety in autonomous flight
+ *
+ * @boolean
+ * @group Multicopter Position Control
+ */
+PARAM_DEFINE_INT32(CP_AUTO_EN, 0);
+
+/**
+ * Maximum tilt angle when autonomous collision prevention is active
+ *
+ * Limits the horizontal acceleration requested by autonomous collision prevention
+ * to reduce vehicle tilt while using obstacle sensors.
+ *
+ * @min 0
+ * @max 45
+ * @unit deg
+ * @group Multicopter Position Control
+ */
+PARAM_DEFINE_FLOAT(CP_MAX_ANGLE, 10.0f);
+
+/**
+ * Vehicle XY velocity threshold for collision stop detection
+ *
+ * @min 0.05
+ * @max 1
+ * @unit m/s
+ * @group Multicopter Position Control
+ */
+PARAM_DEFINE_FLOAT(CP_STOP_VEL, 0.2f);
+
+/**
+ * Maximum tilt angle used for autonomous collision braking
+ *
+ * Allows stronger braking than normal autonomous collision prevention tilt.
+ *
+ * @min 0
+ * @max 45
+ * @unit deg
+ * @group Multicopter Position Control
+ */
+PARAM_DEFINE_FLOAT(CP_BRAKE_ANGLE, 30.0f);

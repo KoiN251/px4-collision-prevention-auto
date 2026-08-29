@@ -76,7 +76,15 @@ bool FlightTaskAuto::activate(const trajectory_setpoint_s &last_setpoint)
 
 	_updateTrajConstraints();
 	_is_emergency_braking_active = false;
+
 	_time_last_cruise_speed_override = 0;
+
+	_collision_braking_active = false;
+	_collision_posctl_requested = false;
+	_collision_hold_requested = false;
+	_collision_clear_start = 0;
+	_collision_no_data_start = 0;
+	_collision_last_no_data_warning = 0;
 
 	return ret;
 }
@@ -169,8 +177,10 @@ bool FlightTaskAuto::update()
 
 	const bool should_wait_for_yaw_align = _param_mpc_yaw_mode.get() == int32_t(yaw_mode::towards_waypoint_yaw_first)
 					       && !_yaw_sp_aligned;
-	const bool force_zero_velocity_setpoint = should_wait_for_yaw_align || _is_emergency_braking_active;
+	bool force_zero_velocity_setpoint = should_wait_for_yaw_align || _is_emergency_braking_active;
 	_updateTrajConstraints();
+	_updateCollisionPreventionConstraints(force_zero_velocity_setpoint);
+
 	PositionSmoothing::PositionSmoothingSetpoints smoothed_setpoints;
 	_position_smoothing.generateSetpoints(
 		_position,
@@ -844,4 +854,179 @@ void FlightTaskAuto::updateParams()
 
 	// make sure that alt1 is above alt2
 	_param_mpc_land_alt1.set(math::max(_param_mpc_land_alt1.get(), _param_mpc_land_alt2.get()));
+}
+
+void FlightTaskAuto::_updateCollisionPreventionConstraints(bool &force_zero_velocity_setpoint)
+{
+	const bool applicable_type = _type == WaypointType::position
+				     || _type == WaypointType::velocity
+				     || _type == WaypointType::loiter;
+	const bool is_rtl = _sub_vehicle_status.get().nav_state == vehicle_status_s::NAVIGATION_STATE_AUTO_RTL;
+
+	// active by CP_DIST, AUTO_EN and only for applicable types
+	if (_param_cp_auto_en.get() <= 0 || !_collision_prevention.is_active() || !applicable_type || is_rtl) {
+		return;
+	}
+
+	const float cp_normal_tilt = math::radians(math::constrain(_param_cp_max_angle.get(), 0.f, 45.f));
+	const float cp_brake_tilt = math::radians(math::constrain(_param_cp_brake_angle.get(), 0.f, 45.f));
+
+	const float cp_normal_accel_xy = tanf(cp_normal_tilt) * CONSTANTS_ONE_G;
+	const float cp_brake_accel_xy = tanf(cp_brake_tilt) * CONSTANTS_ONE_G;
+
+	const float normal_accel_xy = math::min(_param_mpc_acc_hor.get(), cp_normal_accel_xy);
+	const float brake_accel_xy = math::max(normal_accel_xy, cp_brake_accel_xy);
+
+	_position_smoothing.setMaxAccelerationXY(normal_accel_xy);
+
+	_collision_prevention.update();
+	// If no distance sensor data is available, force the vehicle to stop and warn the user
+	if (!_collision_prevention.obstacleDataPresent()) {
+		const hrt_abstime now = hrt_absolute_time();
+		const uint8_t nav_state = _sub_vehicle_status.get().nav_state;
+		const bool is_auto_loiter = nav_state == vehicle_status_s::NAVIGATION_STATE_AUTO_LOITER;
+
+		if (_collision_no_data_start == 0) {
+			_collision_no_data_start = now;
+		}
+
+		_collision_clear_start = 0;
+
+		// If the vehicle is already stopped, don't request a hold again
+		force_zero_velocity_setpoint = true;
+		_position_smoothing.setMaxAccelerationXY(brake_accel_xy);
+		_position_smoothing.setCruiseSpeed(0.f);
+		_position_smoothing.setMaxVelocityXY(0.f);
+
+		if (now - _collision_last_no_data_warning > 1_s) {
+			mavlink_log_critical(&_mavlink_log_pub, "Collision Prevention: distance sensor data lost\t");
+			_collision_last_no_data_warning = now;
+		}
+
+		if (is_auto_loiter) {
+			_collision_hold_requested = false;
+
+		} else if (now - _collision_no_data_start > 1_s && !_collision_hold_requested) {
+			_requestCollisionHold();
+			_collision_hold_requested = true;
+		}
+
+		return;
+	}
+
+	_collision_no_data_start = 0;
+	matrix::Vector2f travel_direction{};
+
+	if (Vector2f(_velocity_setpoint).isAllFinite() && Vector2f(_velocity_setpoint).longerThan(0.1f)) {
+		travel_direction = Vector2f(_velocity_setpoint);
+
+	} else if (Vector2f(_position_setpoint).isAllFinite()) {
+		travel_direction = Vector2f(_position_setpoint) - Vector2f(_position);
+
+	} else {
+		return;
+	}
+
+	if (!travel_direction.longerThan(0.1f)) {
+		return;
+	}
+
+	const auto safe_velocity = _collision_prevention.calculateSafeVelocity(
+						   travel_direction,
+						   _velocity.xy(),
+						   _param_mpc_jerk_auto.get(),
+						   brake_accel_xy);
+
+	if (!safe_velocity.valid) {
+		if (_collision_braking_active) {
+			const hrt_abstime now = hrt_absolute_time();
+
+			if (_collision_clear_start == 0) {
+				_collision_clear_start = now;
+			}
+
+			force_zero_velocity_setpoint = true;
+			_position_smoothing.setMaxAccelerationXY(brake_accel_xy);
+			_position_smoothing.setCruiseSpeed(0.f);
+			_position_smoothing.setMaxVelocityXY(0.f);
+
+			if (now - _collision_clear_start > 1_s) {
+				_collision_braking_active = false;
+				_collision_clear_start = 0;
+				_collision_posctl_requested = false;
+			}
+		}
+
+		return;
+	}
+
+	_collision_clear_start = 0;
+
+	const float constrained_velocity = math::max(0.f, safe_velocity.safe_velocity);
+
+	_position_smoothing.setCruiseSpeed(math::min(_mc_cruise_speed, constrained_velocity));
+	_position_smoothing.setMaxVelocityXY(math::min(_param_mpc_xy_vel_max.get(), constrained_velocity));
+
+	if (safe_velocity.braking_required || safe_velocity.critical) {
+		_collision_braking_active = true;
+		_position_smoothing.setMaxAccelerationXY(brake_accel_xy);
+	}
+
+	if (safe_velocity.critical) {
+		force_zero_velocity_setpoint = true;
+	}
+
+	if (_collision_braking_active && _isCollisionStopConfirmed() && !_collision_posctl_requested) {
+		_requestCollisionPosctl();
+		_collision_posctl_requested = true;
+	}
+}
+
+bool FlightTaskAuto::_isCollisionStopConfirmed() const
+{
+	return !_velocity.xy().longerThan(_param_cp_stop_vel.get());
+}
+
+void FlightTaskAuto::_requestCollisionPosctl()
+{
+	const vehicle_status_s &vehicle_status = _sub_vehicle_status.get();
+
+	vehicle_command_s command{};
+	command.command = vehicle_command_s::VEHICLE_CMD_DO_SET_MODE;
+	command.param1 = 1.f;
+	command.param2 = static_cast<float>(PX4_CUSTOM_MAIN_MODE_POSCTL);
+	command.param3 = static_cast<float>(PX4_CUSTOM_SUB_MODE_POSCTL_POSCTL);
+
+	command.target_system = vehicle_status.system_id;
+	command.target_component = vehicle_status.component_id;
+	command.source_system = vehicle_status.system_id;
+	command.source_component = vehicle_status.component_id;
+
+	command.confirmation = false;
+	command.from_external = false;
+	command.timestamp = hrt_absolute_time();
+
+	_vehicle_command_pub.publish(command);
+}
+
+void FlightTaskAuto::_requestCollisionHold()
+{
+	const vehicle_status_s &vehicle_status = _sub_vehicle_status.get();
+
+	vehicle_command_s command{};
+	command.command = vehicle_command_s::VEHICLE_CMD_DO_SET_MODE;
+	command.param1 = 1.f;
+	command.param2 = static_cast<float>(PX4_CUSTOM_MAIN_MODE_AUTO);
+	command.param3 = static_cast<float>(PX4_CUSTOM_SUB_MODE_AUTO_LOITER);
+
+	command.target_system = vehicle_status.system_id;
+	command.target_component = vehicle_status.component_id;
+	command.source_system = vehicle_status.system_id;
+	command.source_component = vehicle_status.component_id;
+
+	command.confirmation = false;
+	command.from_external = false;
+	command.timestamp = hrt_absolute_time();
+
+	_vehicle_command_pub.publish(command);
 }
