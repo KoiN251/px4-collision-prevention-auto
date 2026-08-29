@@ -1,4 +1,120 @@
-# PX4 Drone Autopilot
+# PX4 Autonomous Collision Prevention
+
+An experimental extension of PX4 v1.17 that adds collision-prevention behavior to Auto/Mission flight.
+
+The original PX4 Collision Prevention flow is mainly designed for Manual Position mode. This project reuses the existing obstacle map and sensor freshness logic to add a safety layer for autonomous flight.
+
+> Status: Experimental. Core Collision Prevention tests pass. SITL fault-injection support is available. Real-flight validation has not been completed.
+
+## Project scope
+
+This project can:
+
+- limit autonomous horizontal velocity near obstacles;
+- calculate safe velocity using obstacle distance, vehicle velocity, jerk and braking acceleration;
+- brake and force zero velocity when collision risk becomes critical;
+- stop the vehicle and request `AUTO_LOITER` when obstacle data is lost;
+- preserve the original Manual Collision Prevention behavior;
+- ignore Auto Collision Prevention intervention during RTL;
+- simulate Gazebo lidar failure in SITL.
+
+This is a collision-prevention safety layer, not a complete obstacle-avoidance planner. It does not create a new path or automatically choose left/right around an obstacle. The current implementation slows down or stops the vehicle when the mission direction is blocked.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[Distance sensor / Gazebo lidar]
+    B[obstacle_distance uORB]
+    C[CollisionPrevention]
+    D[FlightTaskAuto]
+    E[PositionSmoothing]
+    F[trajectory_setpoint]
+    G[PX4 Position Controller]
+
+    A --> B --> C --> D --> E --> F --> G
+```
+
+The safety layer operates before `trajectory_setpoint` is sent to the normal PX4 position controller. It does not modify `mc_pos_control`, `mc_att_control`, `mc_rate_control`, `control_allocator`, or EKF2.
+
+## Modified areas
+
+| Area | Location | Purpose |
+|---|---|---|
+| Collision Prevention core | `src/lib/collision_prevention/` | Obstacle map and safe-velocity calculation |
+| Auto flight task | `src/modules/flight_mode_manager/tasks/Auto/` | Velocity, braking and mode constraints |
+| SITL bridge | `src/modules/simulation/gz_bridge/` | Gazebo lidar fault injection |
+| Tests | `CollisionPreventionTest.cpp` | Safe velocity and braking tests |
+| Documentation | `docs/collision_prevention_safety_layer_report.md` | Detailed design report |
+
+## Important parameters
+
+| Parameter | Default | Description |
+|---|---:|---|
+| `CP_AUTO_EN` | `0` | Enable Collision Prevention in Auto/Mission |
+| `CP_DIST` | PX4 default | Minimum distance from obstacles |
+| `CP_MAX_ANGLE` | `10 deg` | Normal autonomous acceleration limit |
+| `CP_BRAKE_ANGLE` | `30 deg` | Braking acceleration limit |
+| `CP_STOP_VEL` | `0.2 m/s` | Stop-confirmation velocity threshold |
+| `SIM_GZ_LIDAR_F` | `0` | Stop publishing Gazebo lidar data |
+
+## SITL quick start
+
+```bash
+make px4_sitl gz_x500_lidar_2d
+```
+
+```bash
+param set CP_AUTO_EN 1
+param set CP_DIST 2
+param set CP_MAX_ANGLE 10
+param set CP_BRAKE_ANGLE 30
+```
+
+To simulate lidar failure:
+
+```bash
+param set SIM_GZ_LIDAR_F 1
+```
+
+To restore lidar data:
+
+```bash
+param set SIM_GZ_LIDAR_F 0
+```
+
+Useful topics:
+
+```bash
+listener vehicle_status
+listener trajectory_setpoint
+listener obstacle_distance
+listener mavlink_log
+```
+
+## Test status
+
+```text
+functional-CollisionPrevention: 27 tests passed
+unit-ObstacleMath: 6 tests passed
+```
+
+Auto/Mission integration tests and real hardware validation are still required.
+
+## Known limitations
+
+- No automatic route selection around obstacles.
+- Sensor FOV and unknown-space handling require further validation.
+- Auto/Mission mode-transition tests are incomplete.
+- Mode command acknowledgement and retry behavior require further testing.
+- This project is not a certified flight-safety system.
+
+## Project base and attribution
+
+This project is based on PX4 Autopilot v1.17, branch `release/1.17`, base commit `d6f12ad1c4`.
+Detailed implementation notes are available in [`docs/collision_prevention_safety_layer_report.md`](docs/collision_prevention_safety_layer_report.md).
+
+This repository retains the original PX4 license and copyright notices. PX4 is licensed under the BSD 3-Clause License; see [`LICENSE`](LICENSE).
 
 [![Releases](https://img.shields.io/github/release/PX4/PX4-Autopilot.svg)](https://github.com/PX4/PX4-Autopilot/releases) [![DOI](https://zenodo.org/badge/22634/PX4/PX4-Autopilot.svg)](https://zenodo.org/badge/latestdoi/22634/PX4/PX4-Autopilot)
 
