@@ -852,46 +852,52 @@ void GZBridge::laserScantoLidarSensorCallback(const gz::msgs::LaserScan &msg)
 
 void GZBridge::laserScanCallback(const gz::msgs::LaserScan &msg)
 {
+	// Convert the simulator's LaserScan into PX4's fixed 5-degree obstacle map.
 	static constexpr int SECTOR_SIZE_DEG = 5; // PX4 Collision Prevention uses 5 degree sectors
+	static constexpr int MAX_SECTOR_COUNT =
+		sizeof(obstacle_distance_s::distances) / sizeof(obstacle_distance_s::distances[0]);
 
 	double angle_min_deg = msg.angle_min() * 180 / M_PI;
 	double angle_step_deg = msg.angle_step() * 180 / M_PI;
 
-	int samples_per_sector = std::round(SECTOR_SIZE_DEG / angle_step_deg);
-	int number_of_sectors = msg.ranges_size() / samples_per_sector;
+	// Ignore malformed scans before calculating the downsampling ratio.
+	if (!PX4_ISFINITE(angle_step_deg) || angle_step_deg <= 0. || msg.ranges_size() == 0) {
+		return;
+	}
+
+	// Group enough raw rays to cover one PX4 sector; never use zero samples.
+	int samples_per_sector = math::max(1, static_cast<int>(std::round(SECTOR_SIZE_DEG / angle_step_deg)));
+	int number_of_sectors = math::min(msg.ranges_size() / samples_per_sector, MAX_SECTOR_COUNT);
 
 	std::vector<double> ds_array(number_of_sectors, UINT16_MAX);
 
-	// Downsample -- take average of samples per sector
+	// Downsample using the closest return so a thin obstacle cannot be hidden by averaging.
 	for (int i = 0; i < number_of_sectors; i++) {
 
-		double sum = 0;
-
-		int samples_used_in_sector = 0;
+		double minimum_distance = INFINITY;
 
 		for (int j = 0; j < samples_per_sector; j++) {
 
 			double distance = msg.ranges()[i * samples_per_sector + j];
 
-			// inf values mean no object
-			if (isinf(distance)) {
+			// Non-finite values mean no object was returned for this ray.
+			if (!PX4_ISFINITE(distance)) {
 				continue;
 			}
 
-			sum += distance;
-			samples_used_in_sector++;
+			minimum_distance = math::min(minimum_distance, distance);
 		}
 
-		// If all samples in a sector are inf then it means the sector is clear
-		if (samples_used_in_sector == 0) {
+		// If all samples in a sector are non-finite then the sector is clear within sensor range.
+		if (!PX4_ISFINITE(minimum_distance)) {
 			ds_array[i] = msg.range_max();
 
 		} else {
-			ds_array[i] = sum / samples_used_in_sector;
+			ds_array[i] = minimum_distance;
 		}
 	}
 
-	// Publish to uORB
+	// Publish a BODY_FRD obstacle_distance message to the CP fusion layer.
 	obstacle_distance_s report {};
 
 	// Initialize unknown
@@ -907,10 +913,10 @@ void GZBridge::laserScanCallback(const gz::msgs::LaserScan &msg)
 	report.angle_offset = static_cast<float>(angle_min_deg);
 	report.increment = static_cast<float>(SECTOR_SIZE_DEG);
 
-	// Map samples in FOV into sectors in ObstacleDistance
+	// Map the simulator samples into obstacle_distance sectors.
 	int index = 0;
 
-	// Iterate in reverse because array is FLU and we need FRD
+	// Iterate in reverse because Gazebo reports FLU while PX4 consumes FRD.
 	for (std::vector<double>::reverse_iterator i = ds_array.rbegin(); i != ds_array.rend(); ++i) {
 
 		uint16_t distance_cm = (*i) * 100.;
@@ -927,10 +933,12 @@ void GZBridge::laserScanCallback(const gz::msgs::LaserScan &msg)
 
 		index++;
 	}
+
+	// Fault injection stops publication while leaving the rest of the bridge alive.
 	if (_param_sim_gz_lidar_fault.get()) {
 		return;
 	}
-	
+
 	_obstacle_distance_pub.publish(report);
 }
 

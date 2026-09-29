@@ -79,7 +79,7 @@ public:
 	 * @param setpoint_vel current velocity setpoint as information to be able to stop in time, does not get changed
 	 */
 
- 	void modifySetpoint(matrix::Vector2f &setpoint_accel, const matrix::Vector2f &setpoint_vel);
+	void modifySetpoint(matrix::Vector2f &setpoint_accel, const matrix::Vector2f &setpoint_vel);
 
 	void update(); // update data and calculate constraints not call modifysetpoint in manual mode
 
@@ -87,6 +87,10 @@ public:
 	float getClosestDistance() const { return _closest_dist; } // get closest distance to an obstacle
 	matrix::Vector2f getClosestObstacleDirection() const { return _closest_dist_dir; } // get direction of the closest obstacle
 	float getDistanceInDirection(const matrix::Vector2f &direction); // get distance to an obstacle in a specific direction
+	// Expose the configured delay so downstream speed governors use the same timing margin.
+	float getSensorDelay() const { return _param_cp_delay.get(); }
+	// VFH reads the fused, tilt-corrected map without creating a second subscription.
+	const obstacle_distance_s &getObstacleMapBodyFrame() const { return _obstacle_map_body_frame; }
 
 	struct SafeVelocityResult { // result of the safe velocity calculation
 		bool valid{false};
@@ -98,9 +102,13 @@ public:
 		float measured_velocity_parallel{0.f};
 		matrix::Vector2f obstacle_direction{};
 	};
-	// Calculates the safe velocity in a given direction based on the current obstacle distances, measured velocity and max jerk and braking acceleration
+	// Calculate safe velocity using the default Manual collision-prevention distance.
 	SafeVelocityResult calculateSafeVelocity(const matrix::Vector2f &travel_direction,
 			const matrix::Vector2f &measured_velocity, float max_jerk, float max_braking_accel);
+	// Calculate safe velocity with an explicit minimum clearance, used by Auto.
+	SafeVelocityResult calculateSafeVelocity(const matrix::Vector2f &travel_direction,
+			const matrix::Vector2f &measured_velocity, float max_jerk, float max_braking_accel,
+			float min_distance_to_keep);
 
 	// end fix
 
@@ -128,8 +136,11 @@ protected:
 	/**
 	 * Updates obstacle distance message with measurement from offboard
 	 * @param obstacle, obstacle_distance message to be updated
+	 * @param vehicle_yaw current vehicle yaw in the NED frame
+	 * @param vehicle_attitude current vehicle attitude quaternion
 	 */
-	void _addObstacleSensorData(const obstacle_distance_s &obstacle, const float vehicle_yaw);
+	void _addObstacleSensorData(const obstacle_distance_s &obstacle, const float vehicle_yaw,
+				    const matrix::Quatf &vehicle_attitude);
 
 	/**
 	 * Computes an adaption to the setpoint direction to guide towards free space
@@ -201,6 +212,7 @@ private:
 
 	uORB::Subscription _vehicle_attitude_sub{ORB_ID(vehicle_attitude)};
 	matrix::Quatf _vehicle_attitude{};
+	hrt_abstime _vehicle_attitude_timestamp{0};
 	float _vehicle_yaw{0.f};
 
 	uORB::Publication<collision_constraints_s>	_constraints_pub{ORB_ID(collision_constraints)};		/**< constraints publication */

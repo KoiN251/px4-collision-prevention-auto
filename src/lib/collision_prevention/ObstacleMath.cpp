@@ -32,6 +32,8 @@
  ****************************************************************************/
 
 #include "ObstacleMath.hpp"
+#include <cmath>
+
 #include <mathlib/math/Limits.hpp>
 
 using namespace matrix;
@@ -41,6 +43,7 @@ namespace ObstacleMath
 
 void project_distance_on_horizontal_plane(float &distance, const float yaw, const matrix::Quatf &q_world_vehicle)
 {
+	// Convert the sensor forward axis into NED and keep only its horizontal length.
 	const Quatf q_vehicle_sensor(Quatf(cosf(yaw / 2.f), 0.f, 0.f, sinf(yaw / 2.f)));
 	const Quatf q_world_sensor = q_world_vehicle * q_vehicle_sensor;
 	const Vector3f forward(1.f, 0.f, 0.f);
@@ -49,6 +52,32 @@ void project_distance_on_horizontal_plane(float &distance, const float yaw, cons
 	float horizontal_projection_scale = sensor_direction_in_world.xy().norm();
 	horizontal_projection_scale = math::constrain(horizontal_projection_scale, FLT_EPSILON, 1.0f);
 	distance *= horizontal_projection_scale;
+}
+
+bool project_ray_on_horizontal_plane(const float ray_angle_body, const matrix::Quatf &q_world_vehicle,
+					     const float vehicle_yaw, float &horizontal_angle_body, float &horizontal_scale)
+{
+	if (!PX4_ISFINITE(ray_angle_body) || !PX4_ISFINITE(vehicle_yaw) || !q_world_vehicle.isAllFinite()
+	    || q_world_vehicle.length() < 0.95f || q_world_vehicle.length() > 1.05f) {
+		return false;
+	}
+
+	// The LiDAR ray starts horizontal in BODY_FRD. The full attitude rotates it
+	// into NED, where roll and pitch determine its horizontal component.
+	const Vector3f ray_body{cosf(ray_angle_body), sinf(ray_angle_body), 0.f};
+	const Vector3f ray_world = q_world_vehicle.rotateVector(ray_body);
+
+	horizontal_scale = ray_world.xy().norm();
+
+	if (!PX4_ISFINITE(horizontal_scale) || horizontal_scale <= FLT_EPSILON) {
+		return false;
+	}
+
+	horizontal_scale = math::constrain(horizontal_scale, FLT_EPSILON, 1.f);
+	const float horizontal_angle_world = atan2f(ray_world(1), ray_world(0));
+	horizontal_angle_body = matrix::wrap_pi(horizontal_angle_world - vehicle_yaw);
+
+	return PX4_ISFINITE(horizontal_angle_body);
 }
 
 int get_bin_at_angle(float bin_width, float angle)

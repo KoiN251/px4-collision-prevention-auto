@@ -68,6 +68,20 @@ float sensor_orientation_to_yaw_offset(const SensorOrientation orientation, cons
 void project_distance_on_horizontal_plane(float &distance, const float yaw, const matrix::Quatf &q_world_vehicle);
 
 /**
+ * Projects a body-frame lidar ray onto the world horizontal plane and returns
+ * its bearing in the yaw-only body frame.
+ *
+ * @param ray_angle_body raw ray bearing in the BODY_FRD frame
+ * @param q_world_vehicle vehicle attitude, rotating BODY_FRD to NED
+ * @param vehicle_yaw vehicle yaw used to remove heading from the result
+ * @param horizontal_angle_body projected bearing in the yaw-only body frame
+ * @param horizontal_scale scale from slant range to horizontal range
+ * @return true if the projected ray is valid and has a horizontal component
+ */
+bool project_ray_on_horizontal_plane(float ray_angle_body, const matrix::Quatf &q_world_vehicle,
+					     float vehicle_yaw, float &horizontal_angle_body, float &horizontal_scale);
+
+/**
  * Returns bin index at a given angle from the 0th bin
  * @param bin_width width of a bin in degrees
  * @param angle clockwise angle from start bin in degrees

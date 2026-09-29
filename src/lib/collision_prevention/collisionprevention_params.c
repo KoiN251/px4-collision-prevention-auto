@@ -94,6 +94,60 @@ PARAM_DEFINE_INT32(CP_GO_NO_DATA, 0);
 PARAM_DEFINE_INT32(CP_AUTO_EN, 0);
 
 /**
+ * Minimum distance the vehicle should keep to obstacles in autonomous flight
+ *
+ * This is separate from CP_DIST, which remains the minimum distance used by
+ * manual collision prevention.
+ *
+ * @min 0.1
+ * @max 15
+ * @unit m
+ * @group Multicopter Position Control
+ */
+PARAM_DEFINE_FLOAT(CP_AUTO_DIST, 6.0f);
+
+/**
+ * Collision prevention behavior in autonomous flight
+ *
+ * Stop keeps the existing safe-velocity braking behavior. VFH Avoid selects a
+ * free horizontal direction when the mission direction is blocked.
+ *
+ * @value 0 Stop
+ * @value 1 VFH Avoid
+ * @min 0
+ * @max 1
+ * @group Multicopter Position Control
+ */
+PARAM_DEFINE_INT32(CP_AUTO_MODE, 0);
+
+/**
+ * Maximum horizontal velocity while autonomous VFH avoidance is active
+ *
+ * The mission cruise speed and MPC horizontal velocity limit are still
+ * respected; this parameter adds a dedicated upper bound for VFH motion.
+ *
+ * @min 0.1
+ * @max 12
+ * @unit m/s
+ * @group Multicopter Position Control
+ */
+PARAM_DEFINE_FLOAT(CP_VFH_MAX_VEL, 3.0f);
+
+/**
+ * Emergency stop distance for autonomous VFH avoidance
+ *
+ * VFH starts reducing speed before this threshold using the selected corridor.
+ * When the projected obstacle distance reaches this threshold, Auto commands
+ * an emergency stop instead of continuing the avoidance velocity.
+ *
+ * @min 0.1
+ * @max 15
+ * @unit m
+ * @group Multicopter Position Control
+ */
+PARAM_DEFINE_FLOAT(CP_VFH_STOP_DIST, 1.5f);
+
+/**
  * Maximum tilt angle when autonomous collision prevention is active
  *
  * Limits the horizontal acceleration requested by autonomous collision prevention

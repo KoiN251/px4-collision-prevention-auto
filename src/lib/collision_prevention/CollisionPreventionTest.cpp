@@ -64,7 +64,12 @@ public:
 	}
 	void test_addObstacleSensorData(const obstacle_distance_s &obstacle, const float vehicle_yaw)
 	{
-		_addObstacleSensorData(obstacle, vehicle_yaw);
+		_addObstacleSensorData(obstacle, vehicle_yaw, Quatf(Eulerf(0.f, 0.f, vehicle_yaw)));
+	}
+	void test_addObstacleSensorData(const obstacle_distance_s &obstacle, const float vehicle_yaw,
+					const Quatf &vehicle_attitude)
+	{
+		_addObstacleSensorData(obstacle, vehicle_yaw, vehicle_attitude);
 	}
 	void test_adaptSetpointDirection(Vector2f &setpoint_dir, int &setpoint_index,
 					 float vehicle_yaw_angle_rad)
@@ -923,7 +928,7 @@ TEST_F(CollisionPreventionTest, addObstacleSensorData_offset_bodyframe)
 	int distances_array_size = sizeof(cp.getObstacleMap().distances) / sizeof(cp.getObstacleMap().distances[0]);
 
 	for (int i = 0; i < distances_array_size; i++) {
-		if (i >= 0 && i <= 8) {
+		if ((i >= 0 && i <= 8) || i == CollisionPrevention::BIN_COUNT - 1) {
 			EXPECT_FLOAT_EQ(cp.getObstacleMap().distances[i], 500) << i;
 
 		} else {
@@ -1066,6 +1071,118 @@ TEST_F(CollisionPreventionTest, addObstacleSensorData_bodyframe)
 	}
 
 }
+
+TEST_F(CollisionPreventionTest, addObstacleSensorDataProjectsTiltBeforeSectoring)
+{
+	TestCollisionPrevention cp;
+	obstacle_distance_s obstacle_msg{};
+	obstacle_msg.frame = obstacle_msg.MAV_FRAME_BODY_FRD;
+	obstacle_msg.increment = 5.f;
+	obstacle_msg.min_distance = 20;
+	obstacle_msg.max_distance = 2000;
+	obstacle_msg.angle_offset = 0.f;
+
+	for (uint16_t &distance : obstacle_msg.distances) {
+		distance = UINT16_MAX;
+	}
+
+	// A forward ray remains in body sector 0 after a 45 degree yaw, while
+	// its range is shortened by the 10 degree pitch projection.
+	obstacle_msg.distances[0] = 1000;
+	const float pitch = math::radians(10.f);
+	const float yaw = math::radians(45.f);
+	cp.test_addObstacleSensorData(obstacle_msg, yaw, Quatf(Eulerf(0.f, pitch, yaw)));
+	EXPECT_EQ(cp.getObstacleMap().distances[0], 985);
+
+	// A right-facing ray remains in body sector 18 after a roll, but is
+	// projected to the horizontal plane before it is stored.
+	TestCollisionPrevention rolled_cp;
+	for (uint16_t &distance : obstacle_msg.distances) {
+		distance = UINT16_MAX;
+	}
+
+	obstacle_msg.distances[18] = 1000;
+	const float roll = math::radians(10.f);
+	rolled_cp.test_addObstacleSensorData(obstacle_msg, 0.f, Quatf(Eulerf(roll, 0.f, 0.f)));
+	EXPECT_EQ(rolled_cp.getObstacleMap().distances[18], 985);
+
+	// Combined roll/pitch changes the horizontal bearing, so a 45 degree
+	// lidar sector must be allowed to populate the neighboring body sector.
+	TestCollisionPrevention remapped_cp;
+	for (uint16_t &distance : obstacle_msg.distances) {
+		distance = UINT16_MAX;
+	}
+
+	obstacle_msg.distances[9] = 1000;
+	const float combined_roll = math::radians(20.f);
+	const float combined_pitch = math::radians(10.f);
+	remapped_cp.test_addObstacleSensorData(obstacle_msg, 0.f,
+							Quatf(Eulerf(combined_roll, combined_pitch, 0.f)));
+		EXPECT_NE(remapped_cp.getObstacleMap().distances[8], UINT16_MAX);
+		EXPECT_NE(remapped_cp.getObstacleMap().distances[9], UINT16_MAX);
+		EXPECT_LT(remapped_cp.getObstacleMap().distances[8], 1000);
+		EXPECT_EQ(remapped_cp.getObstacleMap().distances[8], remapped_cp.getObstacleMap().distances[9]);
+
+		for (int i = 0; i < CollisionPrevention::BIN_COUNT; i++) {
+			if (i != 8 && i != 9) {
+				EXPECT_EQ(remapped_cp.getObstacleMap().distances[i], UINT16_MAX) << i;
+			}
+		}
+
+		// A sector crossing 0 degrees must update both neighboring bins.
+		TestCollisionPrevention boundary_cp;
+		for (uint16_t &distance : obstacle_msg.distances) {
+			distance = UINT16_MAX;
+		}
+
+		obstacle_msg.angle_offset = -1.f;
+		obstacle_msg.distances[0] = 500;
+		boundary_cp.test_addObstacleSensorData(obstacle_msg, 0.f);
+		EXPECT_EQ(boundary_cp.getObstacleMap().distances[71], 500);
+		EXPECT_EQ(boundary_cp.getObstacleMap().distances[0], 500);
+		for (int i = 1; i < CollisionPrevention::BIN_COUNT - 1; i++) {
+			EXPECT_EQ(boundary_cp.getObstacleMap().distances[i], UINT16_MAX) << i;
+		}
+
+		// A clear reading must not overwrite a nearer reading in an overlapping
+		// raw sector from the same lidar message.
+		TestCollisionPrevention merge_cp;
+		obstacle_msg.distances[1] = obstacle_msg.max_distance + 1;
+		merge_cp.test_addObstacleSensorData(obstacle_msg, 0.f);
+		EXPECT_EQ(merge_cp.getObstacleMap().distances[71], 500);
+		EXPECT_EQ(merge_cp.getObstacleMap().distances[0], 500);
+		EXPECT_EQ(merge_cp.getObstacleMap().distances[1], obstacle_msg.max_distance + 1);
+
+		// Sentinel readings remain useful if the attitude is invalid. In-range
+		// readings are intentionally skipped because their projected range is
+		// undefined without a valid attitude.
+		TestCollisionPrevention invalid_attitude_cp;
+		for (uint16_t &distance : obstacle_msg.distances) {
+			distance = UINT16_MAX;
+		}
+
+		obstacle_msg.angle_offset = 0.f;
+		obstacle_msg.distances[0] = 0;
+		invalid_attitude_cp.test_addObstacleSensorData(obstacle_msg, 0.f, Quatf(0.f, 0.f, 0.f, 0.f));
+		EXPECT_EQ(invalid_attitude_cp.getObstacleMap().distances[0], 0);
+	}
+
+	TEST_F(CollisionPreventionTest, addObstacleSensorDataRejectsUnsupportedResolution)
+	{
+		TestCollisionPrevention cp;
+		obstacle_distance_s obstacle_msg{};
+		obstacle_msg.frame = obstacle_msg.MAV_FRAME_BODY_FRD;
+		obstacle_msg.increment = 1.f;
+		obstacle_msg.min_distance = 20;
+		obstacle_msg.max_distance = 2000;
+		obstacle_msg.distances[0] = 500;
+
+		cp.test_addObstacleSensorData(obstacle_msg, 0.f);
+
+		for (int i = 0; i < CollisionPrevention::BIN_COUNT; i++) {
+			EXPECT_EQ(cp.getObstacleMap().distances[i], UINT16_MAX) << i;
+		}
+	}
 
 
 TEST_F(CollisionPreventionTest, addObstacleSensorData_resolution_offset)
@@ -1463,4 +1580,54 @@ TEST_F(CollisionPreventionTest, safeVelocityUsesBrakingAcceleration)
 			math::trajectory::computeMaxSpeedFromDistance(4.f, 1.5f, low_braking_accel.stopping_distance, 0.f));
 	EXPECT_FLOAT_EQ(high_braking_accel.safe_velocity,
 			math::trajectory::computeMaxSpeedFromDistance(4.f, 4.f, high_braking_accel.stopping_distance, 0.f));
+}
+
+TEST_F(CollisionPreventionTest, safeVelocityUsesCallerMinimumDistance)
+{
+	TestTimingCollisionPrevention cp;
+	mocked_time = 1_s;
+
+	param_t param = param_handle(px4::params::CP_DIST);
+	float manual_distance = 1.5f;
+	param_set(param, &manual_distance);
+	cp.paramsChanged();
+
+	cp.test_setObstacleBin(0, 250, 2000, mocked_time);
+
+	const auto manual_result = cp.calculateSafeVelocity({1.f, 0.f}, {2.f, 0.f}, 4.f, 2.f);
+	const auto auto_result = cp.calculateSafeVelocity({1.f, 0.f}, {2.f, 0.f}, 4.f, 2.f, 2.5f);
+
+	EXPECT_TRUE(manual_result.valid);
+	EXPECT_TRUE(auto_result.valid);
+	EXPECT_FALSE(manual_result.critical);
+	EXPECT_TRUE(auto_result.critical);
+	EXPECT_GT(manual_result.safe_velocity, auto_result.safe_velocity);
+}
+
+TEST_F(CollisionPreventionTest, twoMeterObstacleUsesAutoStoppingDistance)
+{
+	TestTimingCollisionPrevention cp;
+	mocked_time = 1_s;
+
+	param_t distance_param = param_handle(px4::params::CP_DIST);
+	float manual_distance = 1.5f;
+	param_set(distance_param, &manual_distance);
+
+	param_t delay_param = param_handle(px4::params::CP_DELAY);
+	float delay = 0.4f;
+	param_set(delay_param, &delay);
+	cp.paramsChanged();
+
+	// Use the user's relevant geometry: a 2 m obstacle at -60 degrees,
+	// while the vehicle is travelling in the 0 degree direction.
+	cp.getObstacleMap().angle_offset = -180.f;
+	cp.test_setObstacleBin(24, 200, 3000, mocked_time);
+
+	const auto manual_result = cp.calculateSafeVelocity({1.f, 0.f}, {0.5f, 0.f}, 4.f, 2.f, 1.5f);
+	const auto auto_result = cp.calculateSafeVelocity({1.f, 0.f}, {0.5f, 0.f}, 4.f, 2.f, 2.5f);
+
+	EXPECT_TRUE(manual_result.valid);
+	EXPECT_TRUE(auto_result.valid);
+	EXPECT_FALSE(manual_result.critical);
+	EXPECT_TRUE(auto_result.critical);
 }

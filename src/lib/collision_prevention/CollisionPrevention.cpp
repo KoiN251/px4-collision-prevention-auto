@@ -100,11 +100,14 @@ void CollisionPrevention::modifySetpoint(Vector2f &setpoint_accel, const Vector2
 
 void CollisionPrevention::update()
 {
+	// Cache the latest attitude so BODY_FRD obstacle rays can be projected onto
+	// the horizontal plane using a time-aligned vehicle orientation.
 	if (_vehicle_attitude_sub.updated()) {
 		vehicle_attitude_s vehicle_attitude;
 
 		if (_vehicle_attitude_sub.copy(&vehicle_attitude)) {
 			_vehicle_attitude = Quatf(vehicle_attitude.q);
+			_vehicle_attitude_timestamp = vehicle_attitude.timestamp;
 			_vehicle_yaw = Eulerf(_vehicle_attitude).psi();
 		}
 	}
@@ -121,63 +124,70 @@ float CollisionPrevention::getDistanceInDirection(const Vector2f &direction)
 CollisionPrevention::SafeVelocityResult CollisionPrevention::calculateSafeVelocity(
 	const Vector2f &travel_direction, const Vector2f &measured_velocity, float max_jerk, float max_braking_accel)
 {
+	return calculateSafeVelocity(travel_direction, measured_velocity, max_jerk, max_braking_accel, _param_cp_dist.get());
+}
+
+CollisionPrevention::SafeVelocityResult CollisionPrevention::calculateSafeVelocity(
+	const Vector2f &travel_direction, const Vector2f &measured_velocity, float max_jerk, float max_braking_accel,
+	float min_distance_to_keep)
+{
 	SafeVelocityResult result{};
 
 	const Vector2f travel_dir = travel_direction.unit_or_zero();
 
-	//jerk/acceleration không hợp lệ thì trả về valid=false. Không cố tính bừa.
+	// Reject invalid motion limits instead of producing an unsafe estimate.
 	if (!_obstacle_data_present || !travel_dir.isAllFinite() || !measured_velocity.isAllFinite()
 	    || max_jerk <= FLT_EPSILON || max_braking_accel <= FLT_EPSILON) {
 		return result;
 	}
-	// get current time to calculate age of the data
+	// Use the current time to account for sensor data age in the braking margin.
 	const hrt_abstime now = getTime();
-	// calculate the minimum distance to keep from the obstacle.
-	// This is the maximum of the minimum distance from the obstacle map and the parameter value.
-	const float min_dist_to_keep = math::max(_obstacle_map_body_frame.min_distance * 0.01f, _param_cp_dist.get());
+	// The effective clearance cannot be lower than either the sensor minimum or
+	// the minimum distance requested by the caller (Manual or Auto).
+	const float effective_min_distance_to_keep = math::max(_obstacle_map_body_frame.min_distance * 0.01f,
+			min_distance_to_keep);
 
 	for (int i = 0; i < BIN_COUNT; i++) {
 		const uint16_t bin_distance_cm = _obstacle_map_body_frame.distances[i];
-		// if the distance is smaller than the minimum distance to keep or the bin is empty, SKIP IT!
+		// Ignore bins that are below the sensor minimum or contain no measurement.
 		if (bin_distance_cm <= _obstacle_map_body_frame.min_distance || bin_distance_cm == UINT16_MAX) {
 			continue;
 		}
-		// calculate the direction of the bin in body frame and then in world frame
+		// Convert the obstacle bin direction from body frame to local NED.
 		const float bin_angle = wrap_2pi(_vehicle_yaw
 						+ math::radians((float)i * BIN_SIZE + _obstacle_map_body_frame.angle_offset));
 
 		const Vector2f bin_direction{cosf(bin_angle), sinf(bin_angle)};
-		const float travel_projection = travel_dir.dot(bin_direction); // projection of the travel direction onto the bin direction
+		// Only the component of travel toward this obstacle can require braking.
+		const float travel_projection = travel_dir.dot(bin_direction);
 
 		if (travel_projection <= FLT_EPSILON) {
 			continue;
 		}
-		// calculate the distance to the obstacle in the direction of the bin,
-		// the "measured velocity" in that direction and the delay distance
+		// Project the measured velocity and sensor/controller delay onto the bin.
 		const float obstacle_distance = bin_distance_cm * 0.01f;
 		const float measured_velocity_parallel = math::max(0.f, measured_velocity.dot(bin_direction));
 
 		float delay_distance = measured_velocity_parallel * _param_cp_delay.get();
 
 		const float max_range = _data_maxranges[i] * 0.01f;
-		// if the obstacle distance is smaller than the max range, add the delay distance based on the age of the data
+		// Add the measured data age only for an actual in-range obstacle return.
 		if (obstacle_distance < max_range) {
 			const hrt_abstime data_age = now - _data_timestamps[i];
 			delay_distance += measured_velocity_parallel * (data_age * 1e-6f);
 		}
-		// calculate the stopping distance based on the obstacle distance,
-		// the minimum distance to keep and the delay distance
-		const float stopping_distance = obstacle_distance - min_dist_to_keep - delay_distance;
-		// calculate the maximum velocity towards the obstacle based on the stopping distance, max jerk and max braking acceleration
+		// Reserve the required clearance and delay distance before braking.
+			const float stopping_distance = obstacle_distance - effective_min_distance_to_keep - delay_distance;
+		// Compute the maximum velocity that can stop within the remaining distance.
 		const float max_velocity_towards_obstacle = stopping_distance > 0.f
 				? math::trajectory::computeMaxSpeedFromDistance(max_jerk, max_braking_accel, stopping_distance, 0.f)
 				: 0.f;
-		// calculate the safe velocity in the travel direction based on the maximum velocity towards the obstacle and the projection of the travel direction onto the bin direction
+		// Convert the bin-direction limit into a limit along the travel direction.
 		const float safe_velocity = max_velocity_towards_obstacle / travel_projection;
-		// if the result is not valid or the safe velocity is smaller than the current safe velocity, update the result
+		// Keep the most restrictive obstacle constraint.
 		if (!result.valid || safe_velocity < result.safe_velocity) {
-			result.valid = true; // the result is valid if there is at least one obstacle in the travel direction
-			result.critical = stopping_distance <= 0.f; // if the stopping distance is smaller than or equal to 0, the situation is critical
+			result.valid = true;
+			result.critical = stopping_distance <= 0.f;
 			result.safe_velocity = safe_velocity;
 			result.obstacle_distance = obstacle_distance;
 			result.stopping_distance = stopping_distance;
@@ -217,7 +227,7 @@ void CollisionPrevention::_updateObstacleMap()
 	if (_sub_obstacle_distance.update()) {
 		const obstacle_distance_s &obstacle_distance = _sub_obstacle_distance.get();
 
-		// Update map with obstacle data if the data is not stale
+		// Merge obstacle data only while the message is fresh and has a valid resolution.
 		if (getElapsedTime(&obstacle_distance.timestamp) < RANGE_STREAM_TIMEOUT_US && obstacle_distance.increment > 0.f) {
 			//update message description
 			_obstacle_map_body_frame.timestamp = math::max(_obstacle_map_body_frame.timestamp, obstacle_distance.timestamp);
@@ -225,11 +235,20 @@ void CollisionPrevention::_updateObstacleMap()
 								obstacle_distance.max_distance);
 			_obstacle_map_body_frame.min_distance = math::min(_obstacle_map_body_frame.min_distance,
 								obstacle_distance.min_distance);
-			_addObstacleSensorData(obstacle_distance, _vehicle_yaw);
+			// Do not use an old attitude to rotate a current scan. An invalid or
+			// unaligned attitude is passed as a zero quaternion and handled below.
+			const hrt_abstime attitude_timestamp_delta =
+				_vehicle_attitude_timestamp > obstacle_distance.timestamp
+				? _vehicle_attitude_timestamp - obstacle_distance.timestamp
+				: obstacle_distance.timestamp - _vehicle_attitude_timestamp;
+			const bool attitude_time_aligned = _vehicle_attitude_timestamp != 0
+					&& attitude_timestamp_delta <= 100_ms;
+			const Quatf attitude_for_projection = attitude_time_aligned ? _vehicle_attitude : Quatf(0.f, 0.f, 0.f, 0.f);
+			_addObstacleSensorData(obstacle_distance, _vehicle_yaw, attitude_for_projection);
 		}
 	}
 
-	// publish fused obtacle distance message with data from offboard obstacle_distance and distance sensor
+	// Publish the fused map after all sensor sources have been merged.
 	_obstacle_distance_fused_pub.publish(_obstacle_map_body_frame);
 }
 
@@ -300,7 +319,7 @@ void CollisionPrevention::_calculateConstrainedSetpoint(Vector2f &setpoint_accel
 			    getElapsedTime(&_time_activated) > TIMEOUT_HOLD_US) {
 				_publishVehicleCmdDoLoiter();
 			}
-
+// add a warning to the log and event system, but only once per second
 			PX4_WARN("No obstacle data, not moving...");
 			mavlink_log_critical(&_mavlink_log_pub, "Collision Prevention: no distance sensor data!\t");
 			_last_timeout_warning = now;
@@ -308,8 +327,9 @@ void CollisionPrevention::_calculateConstrainedSetpoint(Vector2f &setpoint_accel
 	}
 }
 
-// TODO this gives false output if the offset is not a multiple of the resolution. to be fixed...
-void CollisionPrevention::_addObstacleSensorData(const obstacle_distance_s &obstacle, const float vehicle_yaw)
+// TODO: This gives false output if the offset is not a multiple of the resolution.
+void CollisionPrevention::_addObstacleSensorData(const obstacle_distance_s &obstacle, const float vehicle_yaw,
+		const Quatf &vehicle_attitude)
 {
 
 	float vehicle_orientation_deg = math::degrees(vehicle_yaw);
@@ -357,42 +377,149 @@ void CollisionPrevention::_addObstacleSensorData(const obstacle_distance_s &obst
 		}
 
 	} else if (obstacle.frame == obstacle.MAV_FRAME_BODY_FRD) {
-		// Obstacle message arrives in body frame (front aligned)
-		// corresponding data index (shift by msg offset)
-		for (int i = 0; i < BIN_COUNT; i++) {
-			for (int j = 0; j < 360 / obstacle.increment; j++) {
+		// Obstacle message arrives in BODY_FRD. Project each sector boundary with
+		// the full attitude, then preserve every overlapping map sector.
+		if (!PX4_ISFINITE(obstacle.increment) || obstacle.increment <= FLT_EPSILON) {
+			mavlink_log_critical(&_mavlink_log_pub, "Obstacle BODY_FRD resolution invalid\t");
+			return;
+		}
+
+		const float source_bin_count_float = 360.f / obstacle.increment;
+		const int source_bin_count = static_cast<int>(roundf(source_bin_count_float));
+		const int source_distance_count = sizeof(obstacle.distances) / sizeof(obstacle.distances[0]);
+
+		if (source_bin_count < 1 || source_bin_count > source_distance_count
+		    || fabsf(source_bin_count_float - static_cast<float>(source_bin_count)) > 1e-3f) {
+			mavlink_log_critical(&_mavlink_log_pub, "Obstacle BODY_FRD resolution unsupported\t");
+			return;
+		}
+
+		uint16_t projected_distances[BIN_COUNT] {};
+		bool projected_data[BIN_COUNT] {};
+
+		// Multiple raw rays can overlap one fused bin after tilt projection.
+		// Keep the closest reading from this message before applying the
+		// cross-sensor priority rules in _enterData().
+		auto add_projected_candidate = [&](const int map_index, const uint16_t distance) {
+			if (!projected_data[map_index]) {
+				projected_distances[map_index] = distance;
+				projected_data[map_index] = true;
+				return;
+			}
+
+			const bool current_is_clear = projected_distances[map_index] >= obstacle.max_distance;
+			const bool candidate_is_clear = distance >= obstacle.max_distance;
+
+			if (!candidate_is_clear || current_is_clear) {
+				projected_distances[map_index] = math::min(projected_distances[map_index], distance);
+			}
+		};
+
+		auto intervals_overlap = [](const float first_lower, const float first_upper,
+								const float second_lower, const float second_upper) {
+				auto linear_overlap = [](const float lower_a, const float upper_a,
+								 const float lower_b, const float upper_b) {
+					constexpr float angle_overlap_epsilon = 1e-3f;
+					return lower_a < upper_b - angle_overlap_epsilon
+					       && upper_a > lower_b + angle_overlap_epsilon;
+				};
+
+				if (first_lower <= first_upper) {
+					if (second_lower <= second_upper) {
+						return linear_overlap(first_lower, first_upper, second_lower, second_upper);
+					}
+
+					return linear_overlap(first_lower, first_upper, second_lower, 360.f)
+					       || linear_overlap(first_lower, first_upper, 0.f, second_upper);
+				}
+
+				if (second_lower <= second_upper) {
+					return linear_overlap(first_lower, 360.f, second_lower, second_upper)
+					       || linear_overlap(0.f, first_upper, second_lower, second_upper);
+				}
+
+				return linear_overlap(first_lower, 360.f, second_lower, 360.f)
+				       || linear_overlap(first_lower, 360.f, 0.f, second_upper)
+				       || linear_overlap(0.f, first_upper, second_lower, 360.f)
+				       || linear_overlap(0.f, first_upper, 0.f, second_upper);
+			};
+
+		for (int j = 0; j < source_bin_count; j++) {
+			if (obstacle.distances[j] == UINT16_MAX) {
+				continue;
+			}
+
+			const float ray_center_angle_body = math::radians(obstacle.angle_offset + j * obstacle.increment);
+			const float ray_lower_angle_body = math::radians(
+				obstacle.angle_offset + j * obstacle.increment - obstacle.increment * 0.5f);
+			const float ray_upper_angle_body = math::radians(
+				obstacle.angle_offset + j * obstacle.increment + obstacle.increment * 0.5f);
+			float horizontal_center_angle_body = 0.f;
+			float horizontal_lower_angle_body = 0.f;
+			float horizontal_upper_angle_body = 0.f;
+			float horizontal_scale = 1.f;
+			float horizontal_lower_scale = 1.f;
+			float horizontal_upper_scale = 1.f;
+
+			const bool projection_valid =
+				ObstacleMath::project_ray_on_horizontal_plane(ray_center_angle_body, vehicle_attitude, vehicle_yaw,
+						horizontal_center_angle_body, horizontal_scale)
+				&& ObstacleMath::project_ray_on_horizontal_plane(ray_lower_angle_body, vehicle_attitude, vehicle_yaw,
+						 horizontal_lower_angle_body, horizontal_lower_scale)
+				&& ObstacleMath::project_ray_on_horizontal_plane(ray_upper_angle_body, vehicle_attitude, vehicle_yaw,
+						 horizontal_upper_angle_body, horizontal_upper_scale);
+
+			const bool in_range_reading = obstacle.distances[j] > obstacle.min_distance
+					&& obstacle.distances[j] < obstacle.max_distance;
+
+			if (!projection_valid) {
+				// Preserve zero and out-of-range sentinel readings even when the
+				// attitude cannot define a horizontal projection. In-range data is
+				// skipped because its horizontal distance would be unreliable.
+				if (in_range_reading) {
+					continue;
+				}
+
+				horizontal_lower_angle_body = matrix::wrap_pi(ray_lower_angle_body);
+				horizontal_upper_angle_body = matrix::wrap_pi(ray_upper_angle_body);
+				horizontal_scale = 1.f;
+			}
+
+			float msg_lower_angle = ObstacleMath::wrap_360(
+				math::degrees(horizontal_lower_angle_body) - _obstacle_map_body_frame.angle_offset);
+			float msg_upper_angle = ObstacleMath::wrap_360(
+				math::degrees(horizontal_upper_angle_body) - _obstacle_map_body_frame.angle_offset);
+			uint16_t corrected_distance = obstacle.distances[j];
+
+			// Preserve zero and out-of-range semantics. Only finite in-range
+			// returns represent a slant range that needs projection.
+			if (obstacle.distances[j] > obstacle.min_distance
+			    && obstacle.distances[j] < obstacle.max_distance) {
+				const float conservative_horizontal_scale = math::min(horizontal_scale,
+						math::min(horizontal_lower_scale, horizontal_upper_scale));
+				corrected_distance = static_cast<uint16_t>(roundf(
+						obstacle.distances[j] * conservative_horizontal_scale));
+			}
+
+			for (int i = 0; i < BIN_COUNT; i++) {
 				float bin_lower_angle = ObstacleMath::get_lower_bound_angle(i, _obstacle_map_body_frame.increment,
 							_obstacle_map_body_frame.angle_offset);
 				float bin_upper_angle = ObstacleMath::get_lower_bound_angle(i + 1, _obstacle_map_body_frame.increment,
 							_obstacle_map_body_frame.angle_offset);
-				float msg_lower_angle = ObstacleMath::get_lower_bound_angle(j, obstacle.increment, obstacle.angle_offset);
-				float msg_upper_angle = ObstacleMath::get_lower_bound_angle(j + 1, obstacle.increment, obstacle.angle_offset);
 
-				// if a bin stretches over the 0/360 degree line, adjust the angles
-				if (bin_lower_angle > bin_upper_angle) {
-					bin_lower_angle -= 360;
+				if (intervals_overlap(msg_lower_angle, msg_upper_angle, bin_lower_angle, bin_upper_angle)) {
+					add_projected_candidate(i, corrected_distance);
 				}
+			}
+		}
 
-				if (msg_lower_angle > msg_upper_angle) {
-					msg_lower_angle -= 360;
-				}
-
-				// Check for overlaps.
-				if ((msg_lower_angle > bin_lower_angle && msg_lower_angle < bin_upper_angle) ||
-				    (msg_upper_angle > bin_lower_angle && msg_upper_angle < bin_upper_angle) ||
-				    (msg_lower_angle <= bin_lower_angle && msg_upper_angle >= bin_upper_angle) ||
-				    (msg_lower_angle >= bin_lower_angle && msg_upper_angle <= bin_upper_angle)) {
-					if (obstacle.distances[j] != UINT16_MAX) {
-
-						if (_enterData(i, obstacle.max_distance * 0.01f, obstacle.distances[j] * 0.01f)) {
-							_obstacle_map_body_frame.distances[i] = obstacle.distances[j];
-							_data_timestamps[i] = _obstacle_map_body_frame.timestamp;
-							_data_maxranges[i] = obstacle.max_distance;
-							_data_fov[i] = 1;
-						}
-					}
-				}
-
+		for (int i = 0; i < BIN_COUNT; i++) {
+			if (projected_data[i]
+			    && _enterData(i, obstacle.max_distance * 0.01f, projected_distances[i] * 0.01f)) {
+				_obstacle_map_body_frame.distances[i] = projected_distances[i];
+				_data_timestamps[i] = _obstacle_map_body_frame.timestamp;
+				_data_maxranges[i] = obstacle.max_distance;
+				_data_fov[i] = 1;
 			}
 		}
 

@@ -92,6 +92,59 @@ TEST(ObstacleMathTest, ProjectDistanceOnHorizontalPlane)
 	EXPECT_NEAR(distance, expected_distance, 1e-5);
 }
 
+TEST(ObstacleMathTest, ProjectLidarRayWithTiltAndYaw)
+{
+	float horizontal_angle = 0.f;
+	float horizontal_scale = 0.f;
+
+	// A level vehicle must preserve both the range and the body bearing.
+	EXPECT_TRUE(ObstacleMath::project_ray_on_horizontal_plane(
+			0.f, Quatf{}, 0.f, horizontal_angle, horizontal_scale));
+	EXPECT_NEAR(horizontal_angle, 0.f, 1e-5f);
+	EXPECT_NEAR(horizontal_scale, 1.f, 1e-5f);
+
+	// Pitch changes the horizontal range but not the forward bearing.
+	const float pitch = math::radians(10.f);
+	EXPECT_TRUE(ObstacleMath::project_ray_on_horizontal_plane(
+			0.f, Quatf(Eulerf(0.f, pitch, 0.f)), 0.f, horizontal_angle, horizontal_scale));
+	EXPECT_NEAR(horizontal_angle, 0.f, 1e-5f);
+	EXPECT_NEAR(horizontal_scale, cosf(pitch), 1e-5f);
+
+	// Roll changes the right-facing ray's horizontal range but not its bearing.
+	const float roll = math::radians(10.f);
+	EXPECT_TRUE(ObstacleMath::project_ray_on_horizontal_plane(
+			M_PI_2_F, Quatf(Eulerf(roll, 0.f, 0.f)), 0.f, horizontal_angle, horizontal_scale));
+	EXPECT_NEAR(horizontal_angle, M_PI_2_F, 1e-5f);
+	EXPECT_NEAR(horizontal_scale, cosf(roll), 1e-5f);
+
+	// Yaw is included in the attitude and then removed once to return to the
+	// yaw-only body map. This guards against double yaw rotation.
+	const float yaw = math::radians(45.f);
+	EXPECT_TRUE(ObstacleMath::project_ray_on_horizontal_plane(
+			0.f, Quatf(Eulerf(0.f, pitch, yaw)), yaw, horizontal_angle, horizontal_scale));
+	EXPECT_NEAR(horizontal_angle, 0.f, 1e-5f);
+	EXPECT_NEAR(horizontal_scale, cosf(pitch), 1e-5f);
+
+	// A non-axis ray verifies the bearing sign and rotation order independently
+	// from the helper's final angle calculation.
+	const float diagonal_ray = math::radians(45.f);
+	const float combined_roll = math::radians(20.f);
+	const float combined_yaw = math::radians(30.f);
+	const Quatf combined_attitude(Eulerf(combined_roll, pitch, combined_yaw));
+	const Vector3f expected_ray_world = combined_attitude.rotateVector(
+			Vector3f(cosf(diagonal_ray), sinf(diagonal_ray), 0.f));
+	const float expected_angle = matrix::wrap_pi(atan2f(expected_ray_world(1), expected_ray_world(0)) - combined_yaw);
+	const float expected_scale = expected_ray_world.xy().norm();
+	EXPECT_TRUE(ObstacleMath::project_ray_on_horizontal_plane(
+			diagonal_ray, combined_attitude, combined_yaw, horizontal_angle, horizontal_scale));
+	EXPECT_NEAR(horizontal_angle, expected_angle, 1e-5f);
+	EXPECT_NEAR(horizontal_scale, expected_scale, 1e-5f);
+
+	// A zero quaternion cannot define a valid ray transform.
+	EXPECT_FALSE(ObstacleMath::project_ray_on_horizontal_plane(
+			0.f, Quatf(0.f, 0.f, 0.f, 0.f), 0.f, horizontal_angle, horizontal_scale));
+}
+
 TEST(ObstacleMathTest, GetBinAtAngle)
 {
 	float bin_width = 5.0f;
