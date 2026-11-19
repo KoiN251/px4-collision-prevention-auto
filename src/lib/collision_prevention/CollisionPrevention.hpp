@@ -89,8 +89,6 @@ public:
 	float getDistanceInDirection(const matrix::Vector2f &direction); // get distance to an obstacle in a specific direction
 	// Expose the configured delay so downstream speed governors use the same timing margin.
 	float getSensorDelay() const { return _param_cp_delay.get(); }
-	// VFH reads the fused, tilt-corrected map without creating a second subscription.
-	const obstacle_distance_s &getObstacleMapBodyFrame() const { return _obstacle_map_body_frame; }
 
 	struct SafeVelocityResult { // result of the safe velocity calculation
 		bool valid{false};
